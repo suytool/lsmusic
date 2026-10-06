@@ -1,0 +1,12 @@
+#!/bin/sh
+# fnOS 配置流程回调（用户修改应用设置/访问权限后执行）。
+# v1.0.19：把飞牛下发的授权目录列表（TRIM_DATA_ACCESSIBLE_PATHS，冒号分隔）
+# 写入 $TRIM_PKGVAR/authorized_paths.conf，供运行中的应用后端实时读取。
+# 本脚本保持纯 POSIX、静默、容错；任何失败都不影响应用运行。
+VAR_DIR="${TRIM_PKGVAR:-}"
+if [ -n "${VAR_DIR}" ] && [ -n "${TRIM_DATA_ACCESSIBLE_PATHS:-}" ]; then
+    if [ -d "${VAR_DIR}" ] && [ -w "${VAR_DIR}" ]; then
+        printf '%s\n' "${TRIM_DATA_ACCESSIBLE_PATHS}" > "${VAR_DIR}/authorized_paths.conf" 2>/dev/null || true
+    fi
+fi
+exit 0

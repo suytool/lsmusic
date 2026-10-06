@@ -1,0 +1,16 @@
+appname               = lsmusic-new
+version               = 1.1.10
+display_name          = LSmusic
+desc                  = LSmusic 音乐下载播放器，支持第三方音源搜索、多品质下载（MP3/FLAC）、歌词与封面嵌入音频文件、自定义命名格式、自定义端口，专为飞牛NAS打造。
+source                = thirdparty
+maintainer            = suytool
+maintainer_url        = https://bbs.fnnas.com
+distributor           = suytool
+distributor_url       = https://bbs.fnnas.com
+platform              = x86
+os_min_version        = 1.0.0
+desktop_uidir         = ui
+desktop_applaunchname = lsmusic-new.main
+ctl_stop              = true
+service_port          = 8899
+checksum = 2437208c2bf1960f939664faabb1e8e8

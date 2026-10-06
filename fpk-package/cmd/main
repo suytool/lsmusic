@@ -1,0 +1,341 @@
+#!/bin/bash
+# ==============================================================================
+#  飞牛 OS (fnOS) LSmusic 应用生命周期核心控制脚本 (start / stop / status)
+#  非root模式：应用以专用包用户运行（run-as: package + username: lsmusic）
+#  生命周期脚本由 fnOS 执行，通过 runuser/su 将服务进程切换到应用用户，
+#  从而只拥有「应用设置 → 访问权限」中授权的文件夹访问能力。
+#  注意：本脚本必须保持纯 POSIX sh 兼容（飞牛可能以 sh 执行，不以 shebang 为准），
+#  禁止使用 mapfile / 进程替换 / &> / 大括号展开 等 bash 专属语法。
+# ==============================================================================
+
+APP_DIR="${TRIM_APPDEST:-$(cd "$(dirname "$0")/.." && pwd)}"
+APP_NAME="${TRIM_APPNAME:-lsmusic-new}"
+
+# 应用专用运行用户（package 模式下由 fnOS 注入；root 模式下为空或 root）
+RUN_USER="${TRIM_USERNAME:-}"
+
+# 动态探测二进制路径（适配平铺和保留层级两种情况）
+if [ -f "${APP_DIR}/fn-lx-player" ]; then
+  BIN_PATH="${APP_DIR}/fn-lx-player"
+elif [ -f "${APP_DIR}/app/fn-lx-player" ]; then
+  BIN_PATH="${APP_DIR}/app/fn-lx-player"
+else
+  BIN_PATH="${APP_DIR}/fn-lx-player"
+fi
+
+# 数据目录使用飞牛NAS提供的持久化目录（重启后不会丢失）
+VAR_DIR="${TRIM_PKGVAR:-${APP_DIR}/var}"
+DATA_DIR="${VAR_DIR}/data"
+CONFIG_FILE="${DATA_DIR}/config.json"
+
+# ------------------------------------------------------------------------------
+#  日志/PID 文件位置（v1.0.17 关键修复）：
+#  飞牛在 package 模式下以【应用用户 lsmusic】执行 cmd/main，
+#  不能写入 /tmp 下 root 拥有的旧日志文件（重定向失败=二进制不启动）。
+#  因此日志与 PID 一律放在应用用户可写的数据目录（TRIM_PKGVAR）下；
+#  若数据目录不可写（极端情况），退回 /tmp 并用 uid 区分文件避免冲突。
+# ------------------------------------------------------------------------------
+LOG_DIR="${VAR_DIR}"
+if [ ! -d "${LOG_DIR}" ]; then
+    mkdir -p "${LOG_DIR}" 2>/dev/null || true
+fi
+if [ -w "${LOG_DIR}" ]; then
+    LOG_FILE="${LOG_DIR}/lsmusic.log"
+    PID_FILE="${LOG_DIR}/lsmusic.pid"
+else
+    LOG_FILE="/tmp/${APP_NAME}-$(id -u).log"
+    PID_FILE="/tmp/${APP_NAME}-$(id -u).pid"
+fi
+
+# 默认端口
+DEFAULT_PORT=8899
+
+# ------------------------------------------------------------------------------
+#  从配置文件读取端口
+# ------------------------------------------------------------------------------
+get_config_port() {
+    if [ -f "${CONFIG_FILE}" ]; then
+        port=$(grep -o '"port"[[:space:]]*:[[:space:]]*[0-9]*' "${CONFIG_FILE}" 2>/dev/null | grep -o '[0-9]*$')
+        if [ -n "${port}" ] && [ "${port}" -gt 0 ] && [ "${port}" -lt 65536 ] 2>/dev/null; then
+            echo "${port}"
+            return
+        fi
+    fi
+    echo "${DEFAULT_PORT}"
+}
+
+# ------------------------------------------------------------------------------
+#  动态更新 app/ui/config 中的端口（脚本以 root 运行，可写安装目录）
+# ------------------------------------------------------------------------------
+update_ui_config_port() {
+    port=$1
+    ui_config=""
+
+    if [ -f "${APP_DIR}/app/ui/config" ]; then
+        ui_config="${APP_DIR}/app/ui/config"
+    elif [ -f "${APP_DIR}/ui/config" ]; then
+        ui_config="${APP_DIR}/ui/config"
+    fi
+
+    if [ -n "${ui_config}" ]; then
+        sed -i "s/\"port\"[[:space:]]*:[[:space:]]*[0-9]*/\"port\": ${port}/g" "${ui_config}" 2>/dev/null || true
+    fi
+}
+
+log_error() {
+    msg="$1"
+    echo "$msg"
+    echo "[ERROR] $msg" >> "${LOG_FILE}" 2>/dev/null || true
+    # 将错误信息写入系统日志文件，供 fnOS 前端弹窗展示
+    if [ -n "$TRIM_TEMP_LOGFILE" ]; then
+        echo "$msg" > "$TRIM_TEMP_LOGFILE"
+        # 附加应用自身日志尾部，便于定位
+        if [ -f "${LOG_FILE}" ]; then
+            echo "--- 最后20行日志 ---" >> "$TRIM_TEMP_LOGFILE"
+            tail -20 "${LOG_FILE}" >> "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+        fi
+    fi
+}
+
+log_info() {
+    echo "$1"
+    echo "[INFO] $1" >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+#  追踪日志（v1.0.16 诊断增强）：记录每次调用与关键步骤，
+#  同时写入 /tmp/lsmusic-trace.log 与 TRIM_TEMP_LOGFILE（启用失败弹窗可显示）。
+#  仅加在 cmd/main 中，不改动任何 install/config 钩子（1.0.14 教训）。
+# ------------------------------------------------------------------------------
+trace() {
+    line="$(date '+%Y-%m-%d %H:%M:%S') [$APP_NAME] $*"
+    echo "$line" >> /tmp/lsmusic-trace.log 2>/dev/null || true
+    if [ -n "$TRIM_TEMP_LOGFILE" ]; then
+        echo "$line" >> "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+    fi
+}
+
+# ------------------------------------------------------------------------------
+#  授权目录列表持久化（v1.0.19 关键机制）：
+#  fnOS（V1.1.8+）通过环境变量 TRIM_DATA_ACCESSIBLE_PATHS（冒号分隔）向应用
+#  告知「应用设置 → 访问权限」中授权的文件夹；用户在应用设置中变更权限时，
+#  fnOS 会走 config 流程（config_callback 同样写入本文件）。
+#  本函数在每次启动时把当前授权列表写入 $TRIM_PKGVAR/authorized_paths.conf，
+#  供运行中的应用后端读取（环境变量只能覆盖本次启动的进程，文件可随时刷新）。
+# ------------------------------------------------------------------------------
+save_access_paths() {
+    if [ -z "${TRIM_DATA_ACCESSIBLE_PATHS:-}" ]; then
+        trace "TRIM_DATA_ACCESSIBLE_PATHS 未设置，跳过授权列表持久化"
+        return 0
+    fi
+    if [ -d "${VAR_DIR}" ] && [ -w "${VAR_DIR}" ]; then
+        printf '%s\n' "${TRIM_DATA_ACCESSIBLE_PATHS}" > "${VAR_DIR}/authorized_paths.conf" 2>/dev/null || true
+        trace "授权目录列表已写入 ${VAR_DIR}/authorized_paths.conf: ${TRIM_DATA_ACCESSIBLE_PATHS}"
+    else
+        trace "跳过授权列表写入：${VAR_DIR} 不可写"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+#  以应用专用用户身份启动服务进程（非 root 运行，仅持有授权目录访问权）
+#  若脚本本身已以应用用户运行（非 root），则直接启动。
+#  注意：nohup 无法执行函数，此处按条件分支内联启动命令，保持 POSIX 兼容。
+# ------------------------------------------------------------------------------
+launch_binary() {
+    if [ "$(id -u)" = "0" ] && [ -n "${RUN_USER}" ] && [ "${RUN_USER}" != "root" ]; then
+        if command -v runuser >/dev/null 2>&1; then
+            nohup runuser -u "${RUN_USER}" -- "${BIN_PATH}" --port "${PORT}" --data "${DATA_DIR}" >> "${LOG_FILE}" 2>&1 &
+            return
+        fi
+        if command -v su >/dev/null 2>&1; then
+            nohup su -s /bin/sh "${RUN_USER}" -c 'exec "$@"' sh "${BIN_PATH}" --port "${PORT}" --data "${DATA_DIR}" >> "${LOG_FILE}" 2>&1 &
+            return
+        fi
+    fi
+    nohup "${BIN_PATH}" --port "${PORT}" --data "${DATA_DIR}" >> "${LOG_FILE}" 2>&1 &
+}
+
+case "$1" in
+  start)
+    # 记录启动开始（便于判断脚本是否被执行）
+    > "${LOG_FILE}" 2>/dev/null || true
+    trace "cmd/main start 被调用 (pwd=$(pwd), uid=$(id -u), 用户=$(id -un))"
+    trace "env: TRIM_APPDEST=${TRIM_APPDEST:-未设置} TRIM_PKGVAR=${TRIM_PKGVAR:-未设置} TRIM_APPNAME=${TRIM_APPNAME:-未设置} TRIM_USERNAME=${TRIM_USERNAME:-未设置} TRIM_GROUPNAME=${TRIM_GROUPNAME:-未设置} TRIM_TEMP_LOGFILE=${TRIM_TEMP_LOGFILE:-未设置} TRIM_DATA_ACCESSIBLE_PATHS=${TRIM_DATA_ACCESSIBLE_PATHS:-未设置}"
+    trace "日志文件: ${LOG_FILE} (可写=$( [ -w "${LOG_FILE}" ] && echo 是 || echo 否 )) 数据目录: ${DATA_DIR}"
+    log_info "LSmusic cmd/main start 被调用，时间: $(date '+%Y-%m-%d %H:%M:%S')"
+    log_info "运行用户: $(id -u) ($(id -un)) 应用用户: ${RUN_USER:-未设置}"
+
+    # 确保数据目录存在，并将持久化数据目录归属交给应用用户
+    # （覆盖从旧版 root 模式升级的情况：历史配置由 root 持有，需移交归属）
+    mkdir -p "${DATA_DIR}" 2>/dev/null || true
+    chmod 755 "${DATA_DIR}" 2>/dev/null || true
+    if [ "$(id -u)" = "0" ] && [ -n "${RUN_USER}" ] && [ "${RUN_USER}" != "root" ]; then
+        chown -R "${RUN_USER}:${TRIM_GROUPNAME:-${RUN_USER}}" "${VAR_DIR}" 2>/dev/null || true
+    fi
+
+    # 持久化飞牛下发的授权目录列表（供后端运行中读取）
+    save_access_paths
+
+    # 读取配置端口
+    PORT=$(get_config_port)
+
+    # 更新ui配置中的端口
+    update_ui_config_port "${PORT}"
+
+    log_info "APP_DIR: ${APP_DIR}"
+    log_info "BIN_PATH: ${BIN_PATH}"
+    log_info "DATA_DIR: ${DATA_DIR}"
+    log_info "PORT: ${PORT}"
+
+    # 检查是否已经在运行
+    if [ -f "$PID_FILE" ]; then
+      OLD_PID=$(cat "$PID_FILE" 2>/dev/null)
+      if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        log_info "${APP_NAME} 已经在运行中 (PID: ${OLD_PID})."
+        exit 0
+      else
+        rm -f "$PID_FILE" 2>/dev/null || true
+      fi
+    fi
+
+    # 检查二进制文件是否存在
+    if [ ! -f "${BIN_PATH}" ]; then
+      log_error "未找到可执行文件: ${BIN_PATH}"
+      log_error "APP_DIR 内容: $(ls -la "${APP_DIR}" 2>&1)"
+      exit 1
+    fi
+
+    # 检查二进制文件是否可执行
+    if [ ! -x "${BIN_PATH}" ]; then
+      log_info "二进制文件无执行权限，尝试添加..."
+      chmod +x "${BIN_PATH}" 2>/dev/null || true
+      if [ ! -x "${BIN_PATH}" ]; then
+        log_error "无法添加执行权限: ${BIN_PATH}"
+        log_error "文件权限: $(ls -la "${BIN_PATH}" 2>&1)"
+        exit 1
+      fi
+    fi
+
+    # 检查应用用户是否存在（package 模式必须存在专用用户）
+    if [ "$(id -u)" = "0" ] && [ -n "${RUN_USER}" ] && [ "${RUN_USER}" != "root" ]; then
+      if ! id "${RUN_USER}" >/dev/null 2>&1; then
+        log_error "应用专用用户 ${RUN_USER} 不存在，请先卸载本应用后重新安装，以便 fnOS 创建应用账号。"
+        log_error "当前运行用户: $(id 2>&1)"
+        exit 1
+      fi
+    fi
+
+    # 检查端口是否被占用
+    if command -v ss >/dev/null 2>&1; then
+      if ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
+        # 若占用端口的是本应用自身进程，则视为已在运行
+        SELF_PID=""
+        [ -f "$PID_FILE" ] && SELF_PID=$(cat "$PID_FILE" 2>/dev/null)
+        if [ -n "$SELF_PID" ] && kill -0 "$SELF_PID" 2>/dev/null; then
+          log_info "${APP_NAME} 已在运行 (PID: ${SELF_PID})，端口 ${PORT} 已监听。"
+          exit 0
+        fi
+        log_error "端口 ${PORT} 已被占用"
+        ss -tlnp 2>/dev/null | grep ":${PORT} " >> "${LOG_FILE}" 2>&1 || true
+        trace "端口 ${PORT} 被占用，占用进程详情: $(ss -tlnp 2>/dev/null | grep ":${PORT} " || echo '无法获取')"
+        exit 1
+      fi
+    fi
+
+    log_info "启动二进制文件 (端口: ${PORT})..."
+    trace "启动二进制文件 (端口: ${PORT}) 用户=${RUN_USER:-当前用户}"
+
+    # 启动后台守护进程（root 时降权到应用用户；否则直接运行）
+    launch_binary
+    DAEMON_PID=$!
+    echo "$DAEMON_PID" > "$PID_FILE" 2>/dev/null || true
+
+    log_info "进程已启动，PID: ${DAEMON_PID}"
+    log_info "等待进程确认启动..."
+
+    # 等待进程确认启动（最多等待10秒）
+    i=1
+    while [ "$i" -le 20 ]; do
+      if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+        log_error "进程已退出 (PID: ${DAEMON_PID})，请根据上方日志确认应用用户是否有权访问数据目录与端口。"
+        # 关键诊断：把二进制实际输出（崩溃原因）附加到系统日志，供弹窗展示
+        if [ -n "$TRIM_TEMP_LOGFILE" ]; then
+          echo "--- 应用进程输出尾部 ---" >> "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+          tail -30 "${LOG_FILE}" >> "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+          echo "--- 数据目录状态 ---" >> "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+          ls -la "${DATA_DIR}" >> "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+        fi
+        trace "进程已退出 PID=${DAEMON_PID}；日志尾部: $(tail -30 "${LOG_FILE}" 2>/dev/null | tr '\n' ' ')"
+        exit 1
+      fi
+
+      # 检查端口是否监听
+      if command -v ss >/dev/null 2>&1; then
+        if ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
+          log_info "${APP_NAME} 启动成功 (PID: ${DAEMON_PID})，端口 ${PORT} 已监听"
+          trace "启动成功 PID=${DAEMON_PID} 端口 ${PORT} 已监听"
+          exit 0
+        fi
+      fi
+
+      sleep 0.5
+      i=$((i + 1))
+    done
+
+    # 进程还在运行但端口未监听，可能还在初始化
+    if kill -0 "$DAEMON_PID" 2>/dev/null; then
+      log_info "${APP_NAME} 进程运行中 (PID: ${DAEMON_PID})，等待端口监听超时"
+      trace "进程运行中但端口未监听超时 PID=${DAEMON_PID}"
+      exit 0
+    else
+      log_error "${APP_NAME} 启动失败，进程已退出"
+      trace "启动失败，进程已退出"
+      exit 1
+    fi
+    ;;
+
+  stop)
+    trace "cmd/main stop 被调用"
+    echo "正在停止 ${APP_NAME}..."
+    if [ -f "$PID_FILE" ]; then
+      PID=$(cat "$PID_FILE" 2>/dev/null)
+      if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        kill "$PID" 2>/dev/null || true
+        i=1
+        while [ "$i" -le 10 ]; do
+          if ! kill -0 "$PID" 2>/dev/null; then
+            break
+          fi
+          sleep 0.3
+          i=$((i + 1))
+        done
+        kill -9 "$PID" 2>/dev/null || true
+      fi
+      rm -f "$PID_FILE" 2>/dev/null || true
+    fi
+    pkill -x "fn-lx-player" 2>/dev/null || true
+    echo "${APP_NAME} 已停止."
+    exit 0
+    ;;
+
+  status)
+    trace "cmd/main status 被调用"
+    if [ -f "$PID_FILE" ]; then
+      PID=$(cat "$PID_FILE" 2>/dev/null)
+      if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        exit 0 # 0 表示正常运行中
+      fi
+    fi
+
+    if pgrep -x "fn-lx-player" >/dev/null 2>&1; then
+      exit 0
+    fi
+
+    exit 3 # 3 表示未运行
+    ;;
+
+  *)
+    echo "使用方法: $0 {start|stop|status}"
+    exit 1
+    ;;
+esac

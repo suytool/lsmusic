@@ -1,0 +1,21 @@
+#!/bin/bash
+# 安装后回调（root 执行）：确保所有脚本与二进制可执行，并移交数据目录归属
+APP_DIR="${TRIM_APPDEST:-$(cd "$(dirname "$0")/.." && pwd)}"
+chmod +x "${APP_DIR}/fn-lx-player" 2>/dev/null || true
+chmod +x "${APP_DIR}/app/fn-lx-player" 2>/dev/null || true
+chmod +x "${APP_DIR}/cmd/"* 2>/dev/null || true
+find "${APP_DIR}" -name "fn-lx-player" -exec chmod +x {} + 2>/dev/null || true
+
+# 生命周期脚本实际所在位置（/var/apps/<appname>/cmd 或 /vol1/@appcenter/<appname>/cmd）
+for cmd_dir in "/var/apps/${TRIM_APPNAME}/cmd" "${APP_DIR}/cmd"; do
+    [ -d "${cmd_dir}" ] && chmod +x "${cmd_dir}/"* 2>/dev/null || true
+done
+
+# 非 root 应用：确保运行时数据目录归属应用专用用户
+VAR_DIR="${TRIM_PKGVAR:-${APP_DIR}/var}"
+RUN_USER="${TRIM_USERNAME:-}"
+if [ -n "${RUN_USER}" ] && [ "${RUN_USER}" != "root" ] && [ -d "${VAR_DIR}" ]; then
+    mkdir -p "${VAR_DIR}/data" 2>/dev/null || true
+    chown -R "${RUN_USER}:${TRIM_GROUPNAME:-${RUN_USER}}" "${VAR_DIR}" 2>/dev/null || true
+fi
+exit 0

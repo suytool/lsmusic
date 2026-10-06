@@ -1,0 +1,10 @@
+#!/bin/sh
+# fnOS 配置流程初始化（环境变量更新前执行）。
+# v1.0.19：把当前授权目录列表先落盘一份，避免任何中断导致列表丢失。
+VAR_DIR="${TRIM_PKGVAR:-}"
+if [ -n "${VAR_DIR}" ] && [ -n "${TRIM_DATA_ACCESSIBLE_PATHS:-}" ]; then
+    if [ -d "${VAR_DIR}" ] && [ -w "${VAR_DIR}" ]; then
+        printf '%s\n' "${TRIM_DATA_ACCESSIBLE_PATHS}" > "${VAR_DIR}/authorized_paths.conf" 2>/dev/null || true
+    fi
+fi
+exit 0

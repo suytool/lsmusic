@@ -1,0 +1,13 @@
+{
+  ".url": {
+    "lsmusic-new.main": {
+      "title": "LSmusic",
+      "icon": "images/icon.png",
+      "type": "iframe",
+      "protocol": "http",
+      "port": 8899,
+      "url": "/",
+      "allUsers": true
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "data-share": {
+    "shares": [
+      {
+        "name": "lsmusic-new/data",
+        "permission": {
+          "rw": ["lsmusic"]
+        }
+      }
+    ]
+  }
+}
